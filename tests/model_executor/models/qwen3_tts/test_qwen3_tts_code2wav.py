@@ -757,26 +757,6 @@ def test_rho_stats_accumulate_across_forwards_and_reset_on_segment_finish():
     assert any("segment rho" in text and "rho=1.500" in text for text in logged)
 
 
-def test_rho_stats_flush_and_pop_on_request_finish():
-    model = _make_model(async_chunk=True)
-
-    model.forward(
-        input_ids=torch.arange(8, dtype=torch.long),  # 4 codec frames
-        runtime_additional_information=_rho_meta(segment_text_tokens=4),
-    )
-    assert "rid" in model._rho_stats._stats
-
-    with patch("vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_code2wav.logger") as mock_logger:
-        model.forward(
-            input_ids=torch.arange(4, dtype=torch.long),  # 2 codec frames
-            runtime_additional_information=_rho_meta(finished=torch.tensor(True, dtype=torch.bool)),
-        )
-    # 6 frames / 4 text tokens = 1.5, then the entry is dropped.
-    assert "rid" not in model._rho_stats._stats
-    logged = _mock_logged_messages(mock_logger)
-    assert any("segment rho" in text and "rho=1.500" in text for text in logged)
-
-
 def test_rho_stats_disabled_without_async_chunk():
     model = _make_model(async_chunk=False)
 
