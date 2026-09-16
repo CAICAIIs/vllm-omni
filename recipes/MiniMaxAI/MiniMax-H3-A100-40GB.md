@@ -1,19 +1,18 @@
 # MiniMax-H3 on A100-SXM4-40GB
 
 This recipe covers MiniMax-H3 FL2VA/Ref2VA serving on **NVIDIA A100-SXM4-40GB**
-(sm80, 40 GiB per GPU). Two validated paths are provided; the TP4 + CPU offload
-path is the lower-latency one, and the DLO path trades latency for much lower
-HBM:
+(sm80, 40 GiB per GPU). Two paths are provided: TP4 with CPU offload (lower
+latency) and distributed layerwise offload (DLO), which trades latency for a
+much smaller denoising footprint:
 
 - **TP4 + CPU offload** — the simplest path; the whole checkpoint streams
-  through host memory, so per-GPU HBM stays at ~22 GiB (official reference with
-  audio, reference-KV cache active; a synthetic reference measured the same
-  ~22 GiB). The worker-aggregated torch peak reported by the API was ~31 GiB
-  for the official-reference run.
-- **DLO (rank-local distributed layerwise offload)** — DiT blocks stream per
-  layer from host memory; per-GPU HBM peaks at ~12.4 GiB (measured,
-  12,583–12,685 MiB), at the cost of wall-clock time (~5.5× slower per request
-  on this node).
+  through host memory. Per-GPU HBM holds ~22.8 GiB (22,827 MiB) through
+  denoising and peaks at ~33.0 GiB (33,741 MiB) while the reference is
+  processed — size for the peak, not for the denoising level.
+- **DLO (rank-local)** — DiT blocks stream from host memory; per-GPU HBM during
+  denoising drops to ~12.4 GiB (12,583–12,685 MiB) at roughly 5× the wall-clock
+  time. The peak does not drop with it: 33-35 GiB transients on a single rank
+  appeared in two of three measured runs.
 
 A100 is sm80: **NVFP4 and hardware FP8 paths are unavailable** (FP8 tensor
 cores require sm89+), so use BF16 throughout. The text encoder (Qwen3-VL) and
@@ -26,35 +25,30 @@ at a time, or use the combined FL2VA + Ref2VA layout from the main recipe.
 | --- | ---: | ---: |
 | GPU HBM | 40 GiB per GPU | 40 GiB per GPU |
 | Checkpoint storage | 135 GiB per partition | 135 GiB per partition |
-| Available system RAM | 150 GiB minimum | 150 GiB minimum |
+| Available system RAM | 200 GiB minimum | 200 GiB minimum |
 | Recommended system RAM | 384 GiB | 384 GiB |
 
-`FL2VA` and `Ref2VA` are separate ~135 GiB checkpoint partitions. Host RAM
-matters most for the CPU-offload path: the entire active partition (weights +
-pinned staging) lives in host memory. The DLO path uses TP1 rank-local mmap
-([#6213](https://github.com/vllm-project/vllm-omni/pull/6213)): the four DP
-replicas share the checkpoint's OS page cache on one node instead of holding
-four private copies, and each worker keeps only two bounded pinned staging
-slots (2×~1.2 GiB observed). The 150 GiB minimum for the DLO column is sized
-for ~135 GiB of shared checkpoint pages plus staging; the completed DLO run
-below was not instrumented for host-RSS, so keep 150 GiB unless you measure a
-smaller footprint on your node.
+`FL2VA` and `Ref2VA` are separate ~135 GiB checkpoint partitions. The
+CPU-offload path holds the active partition in host memory; the rank-local DLO
+path uses TP1 rank-local mmap
+([#6213](https://github.com/vllm-project/vllm-omni/pull/6213)), where the four
+DP replicas share one checkpoint page-cache copy instead of holding four private
+copies. Both stay within the 200 GiB minimum, mostly as reclaimable page cache.
+The AllGather variant keeps private shmem shards instead and needs more host
+memory — see its section below.
 
 ## Four A100-40GB: TP4 + CPU offload (480x256, 4 seconds)
 
 Use TP4 with model-level CPU offload (`--enable-cpu-offload`, the same
 sequential-offload mechanism as the 4×L40S report in [issue #5700][l40s-comment],
-minus that report's vLLM-core offload flags, which are no-ops for diffusion —
-see the note below the command): per-GPU HBM peaks at ~22 GiB
-(BF16, synthetic 4s reference) and the request completes in roughly
-300-370 s for 50 denoising steps at 480x256 (machine-load dependent).
+without that report's vLLM-core offload flags — see the note below the command).
+A 50-step 480x256 request completes in roughly 360-390 s, depending on machine
+load.
 
-`--vae-patch-parallel-size 4` is safe on current main: the 4×L40S report
-warned about `ValueError: Found empty tasks on sp rank 3` when decoder tiles
-are fewer than ranks, but that was fixed by
-[#6345](https://github.com/vllm-project/vllm-omni/pull/6345) (rank-local tiling
-fallback), which is present in the recipe's base. The 480x256 runs below
-exercise exactly this path.
+`--vae-patch-parallel-size 4` is safe on current main: the 4×L40S report warned
+about `ValueError: Found empty tasks on sp rank 3` when decoder tiles are fewer
+than ranks, but [#6345](https://github.com/vllm-project/vllm-omni/pull/6345)
+added the rank-local tiling fallback and is present in the recipe's base.
 
 ```bash
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
@@ -70,41 +64,49 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 vllm serve /path/to/MiniMax-H3/FL2VA \
   --diffusion-attention-backend CUDNN_ATTN
 ```
 
-> The vLLM-core flags `--cpu-offload-gb`, `--offload-group-size`,
-> `--offload-num-in-group`, and `--offload-prefetch-step` are **no-ops for
-> diffusion models** — they configure the autoregressive offloaders in
-> `vllm/config/offload.py`, which `vllm_omni` never reads. MiniMax-H3's CPU
-> offload is driven solely by `--enable-cpu-offload`
-> (`enable_omni_model_cpu_offload` → `apply_sequential_offload`). The 4×L40S
-> report in #5700 attributed its low VRAM to that flag combo, but the memory
-> savings there also came from `--enable-cpu-offload`; the extra flags only
-> emitted a vLLM-core warning (`offload_backend="auto"` with both UVA and
-> prefetch fields set).
+> `--cpu-offload-gb`, `--offload-group-size`, `--offload-num-in-group` and
+> `--offload-prefetch-step` are **no-ops for diffusion models** — they configure
+> the autoregressive offloaders in `vllm/config/offload.py`, which `vllm_omni`
+> never reads. MiniMax-H3 CPU offload is driven solely by
+> `--enable-cpu-offload` (`enable_omni_model_cpu_offload` →
+> `apply_sequential_offload`). A/B measurements show identical memory behavior
+> with and without them.
 
 For Ref2VA, stop the server and restart with `/path/to/MiniMax-H3/Ref2VA`.
-With the official reference video (1344x768, includes an audio reference) the
-live per-GPU peak was ~22.3 GiB (nvidia-smi) during the 480x256/96-frame run —
-within 40 GiB with headroom for longer prompts or more references. The
-worker-aggregated torch peak reported by the API (`peak_memory_mb`) was
-~31 GiB for the same run; this is a process-aggregate metric, not a per-GPU
-figure.
+
+Per-GPU HBM has two levels. With the official reference video (1344x768, with an
+audio reference), the 480x256/96-frame run holds ~22.8 GiB (22,827 MiB) through
+the 49 denoising steps but peaks at ~33.0 GiB (33,741 MiB) during reference
+processing, on all four ranks, in repeated runs. That peak leaves ~7 GiB of the
+40 GiB card free, so longer or multiple references can reach the limit.
+
+The API reports `peak_memory_mb` = 32,098 for the same run. The field is the
+**primary worker's (global rank 0) torch peak reserved memory in MiB**
+(`max_memory_reserved`, bytes/1024²): it is not a worker sum, not an nvidia-smi
+figure, and it includes allocator pool retention.
 
 ## Four A100-40GB: DLO rank-local (lower HBM)
 
-If HBM headroom is needed (e.g. co-tenant workloads), the rank-local DLO path
-keeps weights in host memory / shared page cache (~3.1 GiB per GPU after model
-loading) and streams DiT blocks per denoising step. It is slower per step
-because every denoising step streams non-resident DiT blocks over PCIe (H2D
-copies; no-AllGather mode does not use NVLink collectives).
+If more HBM headroom is needed, the rank-local DLO path keeps weights in host
+memory / shared page cache (~3.1 GiB per GPU after model loading) and streams
+DiT blocks per denoising step. It is much slower per step than the TP4 path
+(~38 s vs ~5.6 s per denoising step) because each rank streams complete blocks
+over PCIe and uses no NVLink collectives; the AllGather variant sends only each
+rank's shard and is ~1.7× faster overall — see the comparison below.
 
-**Validation:** this DLO command was validated end-to-end with the same request
-as the TP4 path (official 1344×768 reference video with audio, 480×256/96
-frames, seed 0): a full 50-step Ref2VA run completed (`status=completed`) with
-a live per-GPU peak of **~12.4 GiB** (nvidia-smi, 12,583–12,685 MiB) and total
-inference time of **2012.8 s** (~5.5× the TP4 path's 364.5 s). The API
-worker-aggregated `peak_memory_mb` was 19,108 for the same run. An earlier DLO
-attempt on this node OOM'd in an activation layer; the run below is the one
-that completed — re-measure on your own node before trusting the numbers.
+Validation: a full 50-step Ref2VA run with the same request as the TP4 path
+(official 1344×768 reference video with audio, 480x256/96 frames, seed 0)
+completed with `status=completed` in 1844.6 s (~38 s per denoising step); an
+earlier run of the same command took 2012.8 s (~40 s per step). The API
+reported `peak_memory_mb` = 19,108 (same metric as above).
+
+Denoising per-GPU HBM is much lower than the TP4 path: 12,583–12,685 MiB, and
+up to ~20.4 GiB on the rank that processes the reference. The peak is not lower
+though — two of three measured runs showed a few-second, single-rank transient of
+33-35 GiB during startup or reference processing, so a 40 GiB card keeps roughly
+the same ~5-7 GiB of headroom as the TP4 path. An earlier DLO attempt OOM'd in
+an activation layer before completing, so re-measure peak HBM on your own
+hardware.
 
 ```bash
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
@@ -123,55 +125,60 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 vllm serve /path/to/MiniMax-H3/FL2VA \
 This is the official TP1 rank-local DLO topology
 ([docs](https://github.com/vllm-project/vllm-omni/blob/main/docs/user_guide/diffusion/offloader/distributed_layerwise_offload.md)):
 `--data-parallel-size 4` with `--dlo-no-use-allgather` runs four independent DP
-replicas, each streaming complete rank-local blocks. On current main the
-loader's direct-checkpoint mmap plan (`checkpoint_mmap`) is supported for TP1:
-the four replicas map the same checkpoint file, sharing the OS page cache, so
-this is **not** four private 135 GiB copies. Each worker keeps only two bounded
-pinned staging slots (`distributed_layerwise_backend.py` logs "checkpoint pages
-are node-shared; each worker owns only two bounded host staging slots").
+replicas, each streaming complete rank-local blocks. The loader's
+direct-checkpoint mmap plan (`checkpoint_mmap`) supports TP1: the four replicas
+map the same checkpoint file and share its page cache, so this is **not** four
+private 135 GiB copies, and each worker keeps only two bounded pinned staging
+slots.
 
 > Note: DP-level request concurrency (one request per rank per denoising wave)
-> is currently gated on the AllGather path; for rank-local no-AllGather it is
+> is currently gated on the AllGather path. For rank-local no-AllGather it was
 > the subject of [PR #5911](https://github.com/vllm-project/vllm-omni/pull/5911),
-> which is not yet merged. Until then, treat this DP4 command as four replicas
-> that each serve their own sequential requests (or a single request fanned
-> out), not as one batch of four concurrent requests.
+> which is closed, so treat this DP4 command as four replicas serving their own
+> sequential requests (or a single request fanned out) rather than one batch of
+> four concurrent requests.
 
-**Why not AllGather?** The AllGather variant
-(`--dlo-use-allgather`, the default) shards host weights across the DP group
-(≈1/4 of each block per rank) and reconstructs each layer with
-`all_gather_into_tensor` on a communication stream. It is the throughput-
-oriented path: NVLink gathers are cheap on this node (all eight A100s are
-NV12-connected through the NVSwitch), and DP>1 allows one request per rank per
-denoising wave. This recipe validates the rank-local path (`--dlo-no-use-allgather`)
-instead, for two reasons:
+**Why not AllGather?** The AllGather variant (`--dlo-use-allgather`, the
+default) shards host weights across the DLO group (≈1/4 of each block per rank),
+copies each shard to its device, and reconstructs the complete block with
+`all_gather_into_tensor`. Both variants were measured with the same request:
 
-1. **Single-request validation** — AllGather's payoff is DP concurrency (one
-   request per rank per wave), which only shows up with concurrent requests;
-   for one 480×256 request, AllGather adds a synchronized collective per
-   streamed block (every rank must enter each wave) without reducing HBM or
-   latency.
-2. **Host-memory footprint** — rank-local TP1 shared-mmap keeps *one* OS-page-
-   cache copy of the checkpoint on the node, shared by all four replicas and
-   reclaimable under pressure. AllGather pins ≈1/4 of the model in *each* rank
-   (private pinned shards totaling ≈1 full model across the group), which is
-   not shareable or reclaimable. For the "fit on a shared node" goal, the
-   rank-local layout is the more memory-friendly choice.
+| DLO variant | per denoising step | end-to-end | `peak_memory_mb` | denoising HBM | worst sample |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| rank-local (`--dlo-no-use-allgather`) | ~38 s | 1844.6 s | 19,108 | 12,583–12,685 MiB | 33,299 MiB |
+| AllGather (default) | ~22 s | **1069.3 s** | 19,724 | 13,829 MiB | 34,821 MiB |
 
-On a node where concurrent requests are the workload, `--dlo-use-allgather`
-(drop `--dlo-no-use-allgather`) is the recommended variant for throughput;
-re-measure HBM and latency there before adopting it. HSDP + AllGather is
-rejected by the offloader (double-sharding), so keep TP1+DP (or TP-only) when
-switching to AllGather.
+Both "worst sample" values are few-second transients on a single rank; outside
+them the curves stay near the denoising level (rank 0 reaching ~20-21 GiB while
+the reference is processed).
 
-## Eight A100-40GB (not measured)
+AllGather is **1.7× faster end-to-end for a single request**, because each rank
+copies only its ≈1/4 shard H2D instead of a complete block — the same mechanism
+that gives SP ranks 1/N H2D transfer. It does not lower device HBM (the
+reconstructed block still occupies the rotating device slots), and
+`peak_memory_mb` barely separates the two modes. The host-memory footprint
+does: rank-local shared-mmap keeps one reclaimable page-cache copy of the
+checkpoint for all four replicas, while AllGather holds private shards in
+shmem (~249 GiB across the group versus ~185 GiB for rank-local), so on a
+shared host rank-local is the more memory-friendly layout.
 
-Both commands above use **4 of the 8 GPUs** on the testing node
-(`CUDA_VISIBLE_DEVICES=0,1,2,3`; the node had a co-tenant GPU, so TP8 was not
-exercised). TP8 with the same offload flags is *expected* to fit — weights
-shard across eight ranks, so per-GPU weight peak is lower than TP4 — but treat
-the 8-GPU row as an estimate and re-measure peak HBM before trusting it for
-production.
+Switch to `--dlo-use-allgather` (drop `--dlo-no-use-allgather`) when per-rank H2D
+bandwidth or DP concurrency matters, at the cost of the larger host footprint
+above. HSDP + AllGather is rejected by the offloader (double-sharding), so keep
+TP1+DP (or TP-only) when switching.
+
+## Eight A100-40GB (TP8 not validated)
+
+Both commands above use **4 of the 8 GPUs** (`CUDA_VISIBLE_DEVICES=0,1,2,3`);
+TP8 was not exercised for these paths. TP8 *with the same offload flags* is
+expected to fit — weights shard across eight ranks, so the per-GPU weight peak
+is lower than TP4 — but treat it as untested and re-measure peak HBM before
+relying on it.
+
+TP8 *fully resident* (no offload) is a different configuration, and it does not
+fit: `--num-gpus 8 --tensor-parallel-size 8 --text-encoder-tp-size 8
+--vae-patch-parallel-size 8` peaks above 40 GiB on one rank and then aborts with
+an NCCL out-of-memory error at the start of generation.
 
 ## Notes
 
