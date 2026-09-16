@@ -2,9 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Contract tests for the online CAPS segmenter (RFC #6496 mechanism 2).
 
-The first four tests are the worked examples from the PR review: they pin the
-token-by-token call sequence, the cut position and the per-level thresholds, so
-the online state machine cannot silently drift back to an offline helper.
+The first four tests walk two worked examples token by token, pinning the cut
+position and the per-level thresholds so the online state machine cannot
+silently drift back into an offline helper.
 """
 
 import pytest
@@ -69,7 +69,7 @@ _COMMA_AT_L2 = 18  # " fresh,"  -- reaches the level-2 threshold
 
 
 def _segmenter(**kwargs) -> CapacityAdaptiveSegmenter:
-    """Segmenter whose capacity equals the remaining budget it is given."""
+    """Segmenter whose capacity equals the remaining capacity it is given."""
     return CapacityAdaptiveSegmenter(warmup_expansion_ratio=1.0, safety_margin=0, **kwargs)
 
 
@@ -85,7 +85,7 @@ def _cuts(capacity: int, tokens: list[str]) -> list[tuple[int, int, bool]]:
 
 
 def test_single_level_example_splits_at_the_sentence_final_boundary():
-    """Review example 1: capacity 10 with level-1 ratio 0.7 cuts at token 8.
+    """Capacity 10 with a level-1 ratio of 0.7 cuts at token 8.
 
     The comma at token 4 stays open because the clause level needs 8 tokens.
     """
@@ -93,7 +93,7 @@ def test_single_level_example_splits_at_the_sentence_final_boundary():
 
 
 def test_weaker_boundary_waits_for_its_own_stricter_threshold():
-    """Review example 2: capacity 20, L1=0.7, L2=0.8 cuts at token 18.
+    """Capacity 20 with L1=0.7 and L2=0.8 cuts at token 18.
 
     The period at token 12 and the comma at token 14 are both too early; only
     the comma at token 18 clears the clause threshold.
@@ -165,14 +165,14 @@ def test_finish_returns_none_when_the_tail_is_empty():
     assert segmenter.finish() is None
 
 
-def test_short_prefix_is_not_reported_as_end_of_text():
+def test_a_short_prefix_stays_open_until_finish():
     """A prefix shorter than the capacity stays open until finish()."""
     segmenter = _segmenter()
     segmenter.start_segment(remaining_capacity=10)
     assert segmenter.append_token("No") is None
 
 
-def test_append_token_requires_an_open_segment():
+def test_append_token_requires_a_started_segment():
     segmenter = _segmenter()
     with pytest.raises(RuntimeError, match="start_segment"):
         segmenter.append_token("token")
@@ -215,7 +215,7 @@ def test_classify_punctuation_level_reads_the_right_boundary(token, expected_lev
     ],
 )
 def test_capacity_is_capped_but_never_bypassed(remaining, ratio, safety, max_tokens, expected):
-    """max_text_tokens only lowers the capacity derived from the remaining budget."""
+    """max_text_tokens only lowers the capacity derived from the remaining capacity."""
     capacity = derive_text_token_capacity(
         remaining_capacity=remaining,
         expansion_ratio=ratio,
@@ -267,7 +267,7 @@ def test_safety_ratio_never_decreases():
 
 
 def test_capacity_uses_the_monotonic_safety_ratio_not_the_duration_ema():
-    """A later fast segment must not widen the hard budget.
+    """A later fast segment must not widen the hard capacity.
 
     The duration EMA falls towards the fast observation, but capacity keeps
     being sized from the monotonic safety ratio, so the planned segment cannot
@@ -288,7 +288,7 @@ def test_short_segment_observations_are_ignored():
 
 
 def test_observed_ratio_is_bounded_by_the_guard_rail():
-    """A pathological observation cannot tighten the budget without bound."""
+    """A pathological observation cannot tighten the capacity without bound."""
     segmenter = CapacityAdaptiveSegmenter(max_expansion_ratio=16.0)
     segmenter.observe_segment(acoustic_steps=100_000, text_tokens=10)
     assert segmenter.safety_ratio == pytest.approx(16.0)
@@ -315,13 +315,13 @@ def test_measured_ratio_shapes_the_next_segment_capacity():
     assert segmenter.start_segment(remaining_capacity=100).force_split_at == 10
 
 
-def test_seam_contract_from_code2wav_measurement_to_next_budget():
+def test_seam_contract_from_code2wav_measurement_to_next_capacity():
     """Seam the live wiring will connect (#6496 mechanism 2).
 
     Code2Wav reports a finished segment as (realized acoustic frames, text
     tokens); the segmenter turns that into the next segment's text capacity.
     ``observe_segment`` is where rho arrives and ``start_segment`` is where the
-    next budget is applied, so this pins both ends of the unwired loop.
+    next capacity is applied, so this pins both ends of the unwired loop.
     """
     segmenter = CapacityAdaptiveSegmenter(safety_margin=0)
     segmenter.observe_segment(acoustic_steps=240, text_tokens=120)  # rho = 2.0
@@ -329,7 +329,7 @@ def test_seam_contract_from_code2wav_measurement_to_next_budget():
 
 
 def test_segment_never_plans_more_acoustic_steps_than_remaining():
-    """#5889 capacity property: capacity * safety_ratio <= remaining budget."""
+    """#5889 capacity property: capacity * safety_ratio <= remaining capacity."""
     segmenter = CapacityAdaptiveSegmenter(safety_margin=0)
     segmenter.observe_segment(acoustic_steps=300, text_tokens=150)  # rho = 2.0
     for remaining in (30, 61, 149, 150, 1000):

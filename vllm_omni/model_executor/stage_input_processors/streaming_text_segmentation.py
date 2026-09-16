@@ -12,7 +12,7 @@ stage, so the cut decision is made as each token arrives and never depends on
 the complete text::
 
     segmenter = CapacityAdaptiveSegmenter(warmup_expansion_ratio=warmup)
-    segmenter.start_segment(remaining_capacity=budget)
+    segmenter.start_segment(remaining_capacity=acoustic_budget)
     while token := next_token():
         cut = segmenter.append_token(token)   # None while the segment stays open
     final = segmenter.finish()                # forced split of the tail
@@ -30,7 +30,7 @@ smoothed estimate: :attr:`~CapacityAdaptiveSegmenter.duration_ratio` is a
 two-sided EMA over accepted observations, while
 :attr:`~CapacityAdaptiveSegmenter.safety_ratio` only ever increases within a
 session and is what sizes segments.  A segment that happens to be fast
-therefore lowers the estimate without ever widening the hard budget, so an
+therefore lowers the estimate without ever widening the hard capacity, so an
 under-estimated ratio cannot plan a segment larger than the acoustic stage can
 finish.
 """
@@ -43,7 +43,7 @@ from dataclasses import dataclass
 
 # ---------------------------------------------------------------------------
 # Punctuation tiers (exclusive; the strongest matching terminal wins).
-# Mirrors the CAPS reference tiers: L1 sentence-final, L2 clause, L3 weak pause.
+# L1 sentence-final, L2 clause, L3 weak pause.
 # ---------------------------------------------------------------------------
 _LEVEL1_PUNCTUATION: tuple[str, ...] = ("。", "！", "？", ".", "!", "?")
 _LEVEL2_PUNCTUATION: tuple[str, ...] = ("，", "、", "；", "：", ",", ";", ":")
@@ -59,14 +59,15 @@ DEFAULT_LEVEL2_CAPACITY_RATIO = 0.80
 DEFAULT_LEVEL3_CAPACITY_RATIO = 0.90
 
 # Acoustic steps reserved before converting remaining capacity into a
-# text-token capacity, so a segment never plans to consume the whole budget.
+# text-token capacity, so a segment never plans to consume the whole remaining
+# capacity.
 DEFAULT_SAFETY_MARGIN = 8
 
 # EMA weight applied to an accepted duration observation.
 DEFAULT_EMA_ALPHA = 0.3
 
 # A segment shorter than this is too noisy to estimate or plan from, so short
-# segments leave both ratios untouched (mirrors the CAPS reference).
+# segments leave both ratios untouched.
 DEFAULT_MIN_DURATION_TOKENS = 8
 
 # Guard rail: a pathological observation (e.g. a hallucination loop) must not
@@ -209,7 +210,7 @@ def derive_text_token_capacity(
     ``capacity = floor((remaining_capacity - safety_margin) / expansion_ratio)``,
     capped by ``max_text_tokens`` when given.  ``max_text_tokens`` only lowers
     the capacity, never bypasses it, so a caller-supplied ceiling cannot plan a
-    segment whose predicted acoustic cost exceeds the remaining budget.
+    segment whose predicted acoustic cost exceeds the remaining capacity.
     """
     if remaining_capacity <= 0:
         raise ValueError(f"remaining_capacity must be positive, got {remaining_capacity}")
@@ -244,7 +245,7 @@ def compute_thresholds(
     Each level's threshold is ``ceil(capacity * ratio)``, so stronger boundaries
     cut earlier and weaker ones require more accumulated text.  The ratios must
     satisfy ``0 < level1 <= level2 <= level3 <= 1`` and the ceiling is exactly
-    the capacity, so tier spacing can never enlarge the budget.  For a small
+    the capacity, so tier spacing can never enlarge it.  For a small
     capacity two levels can round to the same threshold; that is intentional,
     the ceiling still being the enforceable hard limit.
     """
@@ -325,7 +326,7 @@ class CapacityAdaptiveSegmenter:
 
         Monotonically non-decreasing within a session, so a faster-than-planned
         segment can lower :attr:`duration_ratio` without ever widening the hard
-        text budget.
+        text-token capacity.
         """
         return self._safety_ratio
 
@@ -347,7 +348,7 @@ class CapacityAdaptiveSegmenter:
         affects a segment already open; only segments opened afterwards.
 
         Only degenerate and too-short segments are ignored, so a truncated or
-        noisy segment cannot distort the estimate that future budgets rest on.
+        noisy segment cannot distort the estimate that future segment sizes rest on.
         """
         if text_tokens <= 0 or acoustic_steps <= 0:
             return
