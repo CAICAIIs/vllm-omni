@@ -56,26 +56,48 @@ class _SegmentRhoTracker:
     """Per-request rho = acoustic frames (A_k) / text tokens (n_k) accounting.
 
     Accumulates realized codec frames and decode forwards per request and
-    logs the ratio at segment/request boundaries. Segments are delimited by
-    the scheduler's ``is_segment_finished`` flag; n_k arrives via the
-    payload meta (``segment_text_tokens``). Disabled on the non-async-chunk
-    path, where the ramp is static.
+    logs the ratio at segment/request boundaries.  Segments are delimited by
+    the scheduler's ``is_segment_finished`` flag.
+
+    n_k is derived here, not carried per payload: the payload meta ships
+    ``request_text_tokens``, the *running* assistant text-token count of the
+    request, which covers every segment released so far because a resumable
+    request keeps one request ID across segments.  A segment's own n_k is the
+    increase of that running count between its boundary and the previous one,
+    so segment 2 is logged as A_2 / n_2 and never as A_2 / n_request.
+
+    Disabled on the non-async-chunk path, where the ramp is static.
     """
 
     def __init__(self, *, enabled: bool) -> None:
         self.enabled = enabled
         self._stats: dict[str, dict[str, int]] = {}
 
-    def observe_chunk(self, req_id: str, acoustic_frames: int, text_tokens: int) -> None:
-        """Accumulate one decode chunk's realized frames and forward."""
+    @staticmethod
+    def _new_stats() -> dict[str, int]:
+        """Fresh per-request counters: open segment plus the running base."""
+        return {
+            "seg_frames": 0,
+            "seg_forwards": 0,
+            "seg_text_tokens": 0,
+            "text_tokens_base": 0,
+        }
+
+    def observe_chunk(self, req_id: str, acoustic_frames: int, request_text_tokens: int) -> None:
+        """Accumulate one decode chunk's realized frames and running count.
+
+        ``request_text_tokens`` is the request's running text-token count as
+        carried by this payload, so only its value at the segment's last
+        payload measures the segment; max() keeps it idempotent under repeat
+        delivery of the same payload.
+        """
         if not self.enabled or acoustic_frames <= 0:
             return
-        stats = self._stats.setdefault(req_id, {"seg_frames": 0, "seg_forwards": 0, "seg_text_tokens": 0})
+        stats = self._stats.setdefault(req_id, self._new_stats())
         stats["seg_frames"] += acoustic_frames
         stats["seg_forwards"] += 1
-        # max() keeps n_k idempotent under repeat delivery.
-        if text_tokens > 0:
-            stats["seg_text_tokens"] = max(stats["seg_text_tokens"], text_tokens)
+        if request_text_tokens > 0:
+            stats["seg_text_tokens"] = max(stats["seg_text_tokens"], request_text_tokens)
 
     def flush_empty_payload(
         self,
@@ -153,18 +175,32 @@ class _SegmentRhoTracker:
         self.on_boundary(req_id, finished=True, segment_finished=False)
 
     def _log_segment(self, req_id: str, *, reset: bool) -> None:
-        """Log one segment's rho, zeroing the counters when ``reset``."""
+        """Log one segment's rho, zeroing the segment counters when ``reset``.
+
+        The running text-token base survives the reset: it is what makes the
+        next boundary measure the next segment instead of the request.
+        """
         stats = self._stats.get(req_id)
         if stats is None or stats["seg_forwards"] == 0:
             return
-        if stats["seg_text_tokens"] > 0:
+        text_tokens = stats["seg_text_tokens"]
+        segment_text_tokens = 0
+        if text_tokens > 0:
+            # The base advances to the count observed here, so the next boundary
+            # measures the next segment. A count below the base means the
+            # payload restarted the request's text accounting for this segment
+            # (segment-local ids) instead of extending it, so the increase is
+            # not this segment's n_k and rho is logged without one.
+            segment_text_tokens = text_tokens - stats["text_tokens_base"]
+            stats["text_tokens_base"] = text_tokens
+        if segment_text_tokens > 0:
             logger.info(
                 "Qwen3-TTS segment rho: req=%s frames=%d forwards=%d text_tokens=%d rho=%.3f",
                 req_id,
                 stats["seg_frames"],
                 stats["seg_forwards"],
-                stats["seg_text_tokens"],
-                stats["seg_frames"] / stats["seg_text_tokens"],
+                segment_text_tokens,
+                stats["seg_frames"] / segment_text_tokens,
             )
         else:
             logger.info(
@@ -425,7 +461,7 @@ class Qwen3TTSCode2Wav(nn.Module):
         ref_context_request_ids: list[str | None] = [None] * len(request_ids_list)
         ref_context_included = [False] * len(request_ids_list)
         finished_flags = [False] * len(request_ids_list)
-        segment_text_tokens = [0] * len(request_ids_list)
+        request_text_tokens = [0] * len(request_ids_list)
 
         def _meta_int(value: Any) -> int:
             if isinstance(value, list):
@@ -469,8 +505,8 @@ class Qwen3TTSCode2Wav(nn.Module):
                     ref_context_included[i] = _meta_bool(meta["ref_context_included"])
                 if "finished" in meta:
                     finished_flags[i] = _meta_bool(meta["finished"])
-                if "segment_text_tokens" in meta:
-                    segment_text_tokens[i] = _meta_int(meta["segment_text_tokens"])
+                if "request_text_tokens" in meta:
+                    request_text_tokens[i] = _meta_int(meta["request_text_tokens"])
 
         # Normal runner calls provide scheduler-side IDs, which are also used
         # by scheduler_output.finished_req_ids. Direct forward calls and CUDA
@@ -518,7 +554,7 @@ class Qwen3TTSCode2Wav(nn.Module):
                 self._rho_stats.observe_chunk(
                     state_req_id,
                     frames - (ref_context_size[i] if ref_context_included[i] else 0),
-                    text_tokens=segment_text_tokens[i],
+                    request_text_tokens=request_text_tokens[i],
                 )
             valid_codes_qf.append((state_req_id, codes_qf))
             if state_req_id is not None:

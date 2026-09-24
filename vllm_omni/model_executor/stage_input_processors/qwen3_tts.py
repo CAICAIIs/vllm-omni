@@ -42,20 +42,22 @@ logger = init_logger(__name__)
 
 
 def _precomputed_assistant_text_tokens(request: Any) -> int | None:
-    """Return the request's assistant text-token count (n_k), or ``None``.
+    """Return the request's assistant text-token count carried by this payload.
 
-    Scope: this instrumentation produces n_k only for requests that already
+    Scope: this instrumentation reports a count only for requests that already
     carry precomputed assistant text ids (``PRECOMPUTED_TEXT_IDS_KEY``) in
     ``additional_information``.  A request carrying only the raw text string
     returns ``None`` and Code2Wav then logs rho without n_k; deriving the count
     from raw text needs the model tokenizer and is a follow-up.
 
-    Definition: the value is the number of assistant text ids for the request —
-    the tokenizer output of the assistant chat-template framing plus the text,
-    i.e. the same ids the prompt builder consumes — so template/control tokens
-    are included, not excluded.  It is request-scoped, which equals
-    segment-scoped on the whole-request async-chunk path where one segment
-    covers the whole utterance: exactly the n_k that ``rho = A_k / n_k`` needs.
+    Definition: the value counts the request's assistant text ids — the
+    tokenizer output of the assistant chat-template framing plus the text, i.e.
+    the same ids the prompt builder consumes — so template/control tokens are
+    included, not excluded.  It is a *running request* count, not a segment
+    count: one request ID covers every segment a resumable request is fed, and
+    the ids handed down for the segment being released cover the text released
+    so far.  Code2Wav turns it into the segment's own n_k by taking the increase
+    between consecutive segment boundaries (``_SegmentRhoTracker``).
     """
     additional_information = getattr(request, "additional_information", None)
     if additional_information is None:
@@ -424,9 +426,9 @@ def talker2code2wav_async_chunk(
         meta.ref_context_size = ref_context_size
         meta.ref_context_request_id = ref_context_request_id
         meta.ref_context_included = ref_context_included
-    segment_text_tokens = _precomputed_assistant_text_tokens(request)
-    if segment_text_tokens is not None:
-        meta.segment_text_tokens = segment_text_tokens
+    request_text_tokens = _precomputed_assistant_text_tokens(request)
+    if request_text_tokens is not None:
+        meta.request_text_tokens = request_text_tokens
 
     return OmniPayloadStruct(
         codes=CodesStruct(audio=code_predictor_codes),
@@ -653,9 +655,9 @@ def talker2code2wav_full_payload(
     # async-chunk path, which already ships left_context_size in-band.
     if ref_code is not None and ref_frames > 0:
         meta["left_context_size"] = ref_frames
-    segment_text_tokens = _precomputed_assistant_text_tokens(request)
-    if segment_text_tokens is not None:
-        meta["segment_text_tokens"] = segment_text_tokens
+    request_text_tokens = _precomputed_assistant_text_tokens(request)
+    if request_text_tokens is not None:
+        meta["request_text_tokens"] = request_text_tokens
     return {
         "codes": {"audio": codec_codes},
         "meta": meta,

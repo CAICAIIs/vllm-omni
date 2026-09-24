@@ -741,22 +741,33 @@ def test_rho_stats_accumulate_across_forwards_and_reset_on_segment_finish():
 
     model.forward(
         input_ids=torch.arange(8, dtype=torch.long),  # 4 codec frames
-        runtime_additional_information=_rho_meta(segment_text_tokens=8),
+        runtime_additional_information=_rho_meta(request_text_tokens=8),
     )
     model.forward(
         input_ids=torch.arange(12, dtype=torch.long),  # 6 codec frames
         runtime_additional_information=_rho_meta(),
     )
-    assert model._rho_stats._stats["rid"] == {"seg_frames": 10, "seg_forwards": 2, "seg_text_tokens": 8}
+    assert model._rho_stats._stats["rid"] == {
+        "seg_frames": 10,
+        "seg_forwards": 2,
+        "seg_text_tokens": 8,
+        "text_tokens_base": 0,
+    }
 
     # Segment boundary: the final chunk (2 frames) is accumulated first, so the
-    # logged ratio is 12 frames / 8 text tokens = 1.5, then counters reset.
+    # logged ratio is 12 frames / 8 text tokens = 1.5, then counters reset. The
+    # running base survives and now holds the 8 text tokens this segment covered.
     with patch("vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_code2wav.logger") as mock_logger:
         model.forward(
             input_ids=torch.arange(4, dtype=torch.long),  # 2 codec frames
             runtime_additional_information=_rho_meta(is_segment_finished=torch.tensor(True, dtype=torch.bool)),
         )
-    assert model._rho_stats._stats["rid"] == {"seg_frames": 0, "seg_forwards": 0, "seg_text_tokens": 0}
+    assert model._rho_stats._stats["rid"] == {
+        "seg_frames": 0,
+        "seg_forwards": 0,
+        "seg_text_tokens": 0,
+        "text_tokens_base": 8,
+    }
     logged = _mock_logged_messages(mock_logger)
     assert any("segment rho" in text and "rho=1.500" in text for text in logged)
 
@@ -766,7 +777,7 @@ def test_rho_stats_disabled_without_async_chunk():
 
     model.forward(
         input_ids=torch.arange(8, dtype=torch.long),
-        runtime_additional_information=_rho_meta(segment_text_tokens=8),
+        runtime_additional_information=_rho_meta(request_text_tokens=8),
     )
     assert model._rho_stats._stats == {}
 
@@ -779,10 +790,15 @@ def test_rho_stats_excludes_ref_context_frames():
         runtime_additional_information=_rho_meta(
             ref_context_size=2,
             ref_context_included=True,
-            segment_text_tokens=6,
+            request_text_tokens=6,
         ),
     )
-    assert model._rho_stats._stats["rid"] == {"seg_frames": 2, "seg_forwards": 1, "seg_text_tokens": 6}
+    assert model._rho_stats._stats["rid"] == {
+        "seg_frames": 2,
+        "seg_forwards": 1,
+        "seg_text_tokens": 6,
+        "text_tokens_base": 0,
+    }
 
 
 def test_rho_stats_flushes_partial_segment_on_early_return_finish():
@@ -790,7 +806,7 @@ def test_rho_stats_flushes_partial_segment_on_early_return_finish():
 
     model.forward(
         input_ids=torch.arange(8, dtype=torch.long),  # 4 codec frames
-        runtime_additional_information=_rho_meta(segment_text_tokens=10),
+        runtime_additional_information=_rho_meta(request_text_tokens=10),
     )
 
     # Malformed final payload (length not divisible by num_quantizers) with
@@ -818,9 +834,14 @@ def test_rho_stats_flush_on_empty_finished_input():
 
     model.forward(
         input_ids=torch.arange(8, dtype=torch.long),  # 4 codec frames
-        runtime_additional_information=_rho_meta(segment_text_tokens=8),
+        runtime_additional_information=_rho_meta(request_text_tokens=8),
     )
-    assert model._rho_stats._stats["rid"] == {"seg_frames": 4, "seg_forwards": 1, "seg_text_tokens": 8}
+    assert model._rho_stats._stats["rid"] == {
+        "seg_frames": 4,
+        "seg_forwards": 1,
+        "seg_text_tokens": 8,
+        "text_tokens_base": 0,
+    }
 
     with patch("vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_code2wav.logger") as mock_logger:
         model.forward(
@@ -845,7 +866,7 @@ def test_rho_stats_empty_payload_flush_uses_the_canonical_request_id():
 
     model.forward(
         input_ids=torch.arange(8, dtype=torch.long),  # 4 codec frames
-        runtime_additional_information=_rho_meta(request_id="external-rid", segment_text_tokens=8),
+        runtime_additional_information=_rho_meta(request_id="external-rid", request_text_tokens=8),
         request_ids=["internal-rid"],
     )
     assert "internal-rid" in model._rho_stats._stats
@@ -873,7 +894,7 @@ def test_rho_stats_flush_on_requests_finished():
 
     model.forward(
         input_ids=torch.arange(8, dtype=torch.long),  # 4 codec frames
-        runtime_additional_information=_rho_meta(segment_text_tokens=4),
+        runtime_additional_information=_rho_meta(request_text_tokens=4),
     )
     assert "rid" in model._rho_stats._stats
 
@@ -883,6 +904,70 @@ def test_rho_stats_flush_on_requests_finished():
     assert "rid" not in model._rho_stats._stats
     logged = _mock_logged_messages(mock_logger)
     assert any("segment rho" in text and "rho=1.000" in text for text in logged)
+
+
+def test_rho_stats_log_one_segment_count_per_boundary_not_the_request_total():
+    """Two segment boundaries on one request ID: each n_k is the segment's own.
+
+    A resumable request keeps one request ID while it is fed segment after
+    segment, and the payloads carry the *running* text-token count of the
+    request.  Segment 1 covers 10 text tokens and segment 2 adds 6 more, so
+    segment 2's payloads report 16.  Pairing that 16 with segment 2's frames
+    (the regression this pins) would log rho = 8/16 = 0.500 instead of 8/6.
+    """
+    model = _make_model(async_chunk=True)
+    segment_finished = torch.tensor(True, dtype=torch.bool)
+    request_finished = torch.tensor(True, dtype=torch.bool)
+
+    # Segment 1: two chunks of 4 frames, running count 10 throughout.
+    model.forward(
+        input_ids=torch.arange(8, dtype=torch.long),  # 4 codec frames
+        runtime_additional_information=_rho_meta(request_text_tokens=10),
+    )
+    with patch("vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_code2wav.logger") as mock_logger:
+        model.forward(
+            input_ids=torch.arange(8, dtype=torch.long),  # 4 codec frames
+            runtime_additional_information=_rho_meta(
+                request_text_tokens=10,
+                is_segment_finished=segment_finished,
+            ),
+        )
+    logged = _mock_logged_messages(mock_logger)
+    # 8 frames / the 10 text tokens of segment 1 = 0.8.
+    assert any("segment rho" in text and "text_tokens=10" in text and "rho=0.800" in text for text in logged), logged
+
+    # Segment 2: the running count now covers both segments (16 text tokens).
+    model.forward(
+        input_ids=torch.arange(8, dtype=torch.long),  # 4 codec frames
+        runtime_additional_information=_rho_meta(request_text_tokens=16),
+    )
+    with patch("vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_code2wav.logger") as mock_logger:
+        model.forward(
+            input_ids=torch.tensor([], dtype=torch.long),  # empty-finished sentinel
+            runtime_additional_information=_rho_meta(
+                request_text_tokens=16,
+                finished=request_finished,
+            ),
+        )
+    assert "rid" not in model._rho_stats._stats
+    logged = _mock_logged_messages(mock_logger)
+    # 4 frames / the 6 text tokens segment 2 added = 0.667, and never 16.
+    assert any("segment rho" in text and "text_tokens=6" in text and "rho=0.667" in text for text in logged), logged
+    assert not any("text_tokens=16" in text for text in logged), logged
+
+
+def test_rho_stats_report_unknown_count_without_request_text_tokens():
+    """Payloads carrying no running count leave n_k unknown, and log n/a."""
+    model = _make_model(async_chunk=True)
+
+    with patch("vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_code2wav.logger") as mock_logger:
+        model.forward(
+            input_ids=torch.arange(8, dtype=torch.long),  # 4 codec frames
+            runtime_additional_information=_rho_meta(is_segment_finished=torch.tensor(True, dtype=torch.bool)),
+        )
+    assert model._rho_stats._stats["rid"]["text_tokens_base"] == 0
+    logged = _mock_logged_messages(mock_logger)
+    assert any("segment rho" in text and "text_tokens=n/a" in text for text in logged), logged
 
 
 def _producer_request(rid: str, n_text_ids: int) -> SimpleNamespace:
@@ -911,9 +996,10 @@ def _producer_transfer_manager(rid: str, n_frames: int) -> SimpleNamespace:
 def test_producer_payload_feeds_rho_logging_end_to_end():
     """The real producer payload drives rho logging without further translation.
 
-    Joins the two halves tested separately: the stage-input processor writes
-    n_k into the payload meta and Code2Wav must consume the serialized
-    payload (to_dict shape) and log rho = realized frames / n_k.
+    Joins the two halves tested separately: the stage-input processor writes the
+    request's running text-token count into the payload meta and Code2Wav must
+    consume the serialized payload (to_dict shape) and log rho = realized
+    frames / the segment's text tokens.
     """
     rid = "seam-rid"
     empty_codes = {"codes": {"audio": torch.zeros((0,))}}
@@ -932,7 +1018,7 @@ def test_producer_payload_feeds_rho_logging_end_to_end():
     model = _make_model(async_chunk=True)
 
     chunk_dict = to_dict(chunk_payload)
-    assert chunk_dict["meta"]["segment_text_tokens"] == 12
+    assert chunk_dict["meta"]["request_text_tokens"] == 12
     model.forward(
         input_ids=torch.as_tensor(chunk_dict["codes"]["audio"], dtype=torch.long),  # 4 codec frames
         runtime_additional_information=[chunk_dict],
